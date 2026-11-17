@@ -219,7 +219,7 @@ def evaluate(work):
             failures.append('DB plus WAL exceeds 272 MiB')
         full = meta['qualification'] == 'acceptance'
         if full and lower_values[rank] > 5:
-            failures.append('BUG-079: p95 enforcement latency exceeds 5 seconds')
+            failures.append('p95 enforcement latency exceeds 5 seconds')
         elif full and upper_values[rank] > 5:
             result['limitations'].append('Sampling straddles p95=5s; cannot establish pass or fail for latency.')
         final = status(json.loads((work / 'status-final.json').read_text()))

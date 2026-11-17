@@ -124,7 +124,7 @@ fn parseValue(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(std.json
     return std.json.parseFromSlice(std.json.Value, a, bytes, .{});
 }
 
-test "admin: BUG-032 prefix without address returns 400 and keeps serving" {
+test "admin: prefix without address returns 400 and keeps serving" {
     const a = t.allocator;
     const shared = @import("shared");
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
@@ -163,7 +163,7 @@ test "admin: BUG-032 prefix without address returns 400 and keeps serving" {
     try t.expectEqual(@as(u8, 0), pause.code);
 }
 
-test "admin: BUG-025 unrecorded outcome is uncertain and the request remains fresh" {
+test "admin: unrecorded outcome is uncertain and the request remains fresh" {
     const a = t.allocator;
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
     defer h.deinit();
@@ -184,7 +184,7 @@ test "admin: BUG-025 unrecorded outcome is uncertain and the request remains fre
     defer probe.close();
     try probe.inspectExec(
         "CREATE TRIGGER bug025_admin_outcome BEFORE INSERT ON admin_requests " ++
-            "BEGIN SELECT RAISE(FAIL,'BUG-025 injected outcome failure'); END;",
+            "BEGIN SELECT RAISE(FAIL,'injected outcome failure'); END;",
     );
     const uncertain = try sendAdminFrame(a, &h, request_id, body);
     defer uncertain.deinit(a);
@@ -550,7 +550,7 @@ fn ownerExpiry(items: []const std.json.Value, jail: []const u8) !i64 {
     return error.MissingOwner;
 }
 
-test "kernel: admin: BUG-040 nftables network ban list and unban preserve CIDR" {
+test "kernel: admin: nftables network ban list and unban preserve CIDR" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;

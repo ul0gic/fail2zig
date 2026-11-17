@@ -481,7 +481,7 @@ const Scenario = struct {
     }
 };
 
-test "integration: no backend (a) enforcing jail + default on_no_backend exits 1 naming the cause, no trace (SYS-014)" {
+test "integration: no backend (a) enforcing jail + default on_no_backend exits 1 naming the cause, no trace" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -499,7 +499,7 @@ test "integration: no backend (a) enforcing jail + default on_no_backend exits 1
     }
 }
 
-test "integration: no backend (a') on_no_backend = \"fail-closed\" is the same as the default (SYS-014)" {
+test "integration: no backend (a') on_no_backend = \"fail-closed\" is the same as the default" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -514,7 +514,7 @@ test "integration: no backend (a') on_no_backend = \"fail-closed\" is the same a
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED with the cause; a would-ban logs and never enforces (SYS-014)" {
+test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED with the cause; a would-ban logs and never enforces" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -571,7 +571,7 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
     try testing.expect(!hasErrorReturnTrace(text));
 }
 
-test "integration: no backend (c) all-log-only config runs non-root with Protection: log-only and no detect error (ENH-006)" {
+test "integration: no backend (c) all-log-only config runs non-root with Protection: log-only and no detect error" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -636,7 +636,7 @@ test "integration: no backend helper: trace detector matches Zig frame lines and
 const forced_iptables_cause = "iptables not usable (iptables binary not found on PATH)";
 const forced_ipset_cause = "ipset not usable (ipset or iptables binary not found on PATH)";
 
-test "integration: forced backend (d) firewall = \"iptables\" off PATH + default policy exits 1 naming the forced cause, binds nothing (ENH-007)" {
+test "integration: forced backend (d) firewall = \"iptables\" off PATH + default policy exits 1 naming the forced cause, binds nothing" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
@@ -658,7 +658,7 @@ test "integration: forced backend (d) firewall = \"iptables\" off PATH + default
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: present but unusable command backend refuses before state or socket creation (BUG-037)" {
+test "integration: present but unusable command backend refuses before state or socket creation" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -680,7 +680,7 @@ test "integration: present but unusable command backend refuses before state or 
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: forced backend (d') firewall = \"nftables\" unprivileged + default policy exits 1 with the netlink cause, no fallback (ENH-007)" {
+test "integration: forced backend (d') firewall = \"nftables\" unprivileged + default policy exits 1 with the netlink cause, no fallback" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -703,7 +703,7 @@ test "integration: forced backend (d') firewall = \"nftables\" unprivileged + de
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: log-only backend fallback preserves retry generation across same-state restart (BUG-037)" {
+test "integration: log-only backend fallback preserves retry generation across same-state restart" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
@@ -734,7 +734,7 @@ test "integration: log-only backend fallback preserves retry generation across s
     try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try second.stop());
 }
 
-test "integration: auto selection remains bound to persisted installation transport (BUG-037)" {
+test "integration: auto selection remains bound to persisted installation transport" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
@@ -773,7 +773,7 @@ test "integration: auto selection remains bound to persisted installation transp
     try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try daemon.stop());
 }
 
-test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_backend = \"log-only\" runs DEGRADED (IpsetUnavailable) on IPC and /api/status (ENH-007)" {
+test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_backend = \"log-only\" runs DEGRADED (IpsetUnavailable) on IPC and /api/status" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
@@ -859,7 +859,7 @@ fn unprivilegedNetnsAvailable(a: std.mem.Allocator) bool {
     return r.exitCode() == 0;
 }
 
-test "integration: forced backend (f) firewall = \"nftables\" in an owned netns is selected (forced by config) and enforces (ENH-007)" {
+test "integration: forced backend (f) firewall = \"nftables\" in an owned netns is selected (forced by config) and enforces" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
@@ -893,7 +893,7 @@ test "integration: forced backend (f) firewall = \"nftables\" in an owned netns 
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http: disabled by config, banner http=off, IPC status still answers (ENH-008)" {
+test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http: disabled by config, banner http=off, IPC status still answers" {
     const a = testing.allocator;
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();

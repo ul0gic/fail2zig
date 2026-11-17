@@ -601,7 +601,7 @@ fn readHttpHealth(a: std.mem.Allocator, port: u16) ![]u8 {
     return stream.reader().readAllAlloc(a, 16 * 1024);
 }
 
-test "cli entry: BUG-027 versioned queries, readiness and a file log target with SIGUSR1 reopen" {
+test "cli entry: versioned queries, readiness and a file log target with SIGUSR1 reopen" {
     const a = testing.allocator;
     std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });

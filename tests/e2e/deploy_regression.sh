@@ -147,7 +147,7 @@ done
 
 [ "$(systemctl is-active "$UNIT")" = "active" ] || fail "service not active"
 NR="$(systemctl show -p NRestarts --value "$UNIT")"
-[ "$NR" = "0" ] || fail "NRestarts=$NR (expected 0 — crash-loop signature of SYS-019)"
+[ "$NR" = "0" ] || fail "NRestarts=$NR (expected 0; a higher count is a crash loop)"
 [ "$ready" -eq 1 ] || fail "service active but IPC never became ready"
 pass "service active (running), NRestarts=0"
 

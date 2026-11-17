@@ -152,13 +152,13 @@ pass "drove a typed ban on ${JAIL}"
 TOTAL_PRE="$(status_field total_bans)"
 ACTIVE_PRE="$(status_field active_bans)"
 JAILS_PRE="$(status_field jails_active)"
-[ -n "$TOTAL_PRE" ]  || fail "status 'total_bans' missing/empty (rollup not populated — SYS-017 repro)"
-[ -n "$JAILS_PRE" ]  || fail "status 'jails_active' missing/empty (rollup not populated — SYS-017 repro)"
+[ -n "$TOTAL_PRE" ]  || fail "status 'total_bans' missing/empty (rollup not populated)"
+[ -n "$JAILS_PRE" ]  || fail "status 'jails_active' missing/empty (rollup not populated)"
 [ "$JAILS_PRE" -ge 1 ] 2>/dev/null || fail "jails_active=${JAILS_PRE} (expected >=1)"
 [ "$TOTAL_PRE" -ge 1 ] 2>/dev/null || fail "total_bans=${TOTAL_PRE} after a ban (expected >=1)"
 pass "rollups populated: total_bans=${TOTAL_PRE} active_bans=${ACTIVE_PRE} jails_active=${JAILS_PRE}"
 
-log "restarting $UNIT (BUG-006: Total must persist and stay >= Active)"
+log "restarting $UNIT (Total must persist and stay >= Active)"
 systemctl restart "$UNIT" || fail "systemctl restart failed"
 settle_ready || fail "service did not become ready after restart"
 sleep 1
@@ -169,9 +169,9 @@ ACTIVE_POST="$(status_field active_bans)"
 [ -n "$ACTIVE_POST" ] || fail "status 'active_bans' missing after restart"
 [ "$ACTIVE_POST" -ge 1 ] 2>/dev/null || fail "active_bans=${ACTIVE_POST} after restart (ban not restored?)"
 if [ "$TOTAL_POST" -lt "$ACTIVE_POST" ] 2>/dev/null; then
-  fail "BUG-006 regression: total_bans=${TOTAL_POST} < active_bans=${ACTIVE_POST} after restart"
+  fail "total_bans=${TOTAL_POST} < active_bans=${ACTIVE_POST} after restart"
 fi
-[ "$TOTAL_POST" -ge 1 ] 2>/dev/null || fail "total_bans reset to ${TOTAL_POST} on restart (BUG-006)"
+[ "$TOTAL_POST" -ge 1 ] 2>/dev/null || fail "total_bans reset to ${TOTAL_POST} on restart"
 pass "after restart: total_bans=${TOTAL_POST} >= active_bans=${ACTIVE_POST}, lifetime persisted"
 
 log "ALL STATUS-HONESTY ASSERTIONS PASSED"

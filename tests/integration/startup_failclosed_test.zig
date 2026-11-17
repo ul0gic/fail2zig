@@ -668,7 +668,7 @@ fn requireJournalProfileHost() !void {
     }
 }
 
-test "integration: journal profile BUG-051 omitted auto and explicit sources pass source admission" {
+test "integration: journal profile omitted auto and explicit sources pass source admission" {
     try requireJournalProfileHost();
     std.fs.accessAbsolute("/usr/sbin/sshd", .{}) catch return error.SkipZigTest;
     const a = testing.allocator;

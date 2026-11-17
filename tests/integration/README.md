@@ -36,12 +36,12 @@ To add a file, append one row. Every run depends on `b.getInstallStep()`, so
 `zig-out/bin/fail2zig` is built before the test spawns it.
 Keep changes to this registration table synchronized with the affected integration file.
 
-`no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the
+`no_backend_test.zig` is the inverse of the
 root-gated files: it must run unprivileged so the firewall really is
 unusable. Scenarios (b) and (c) assert the status surface twice: the JSON from
 `GET /api/status` on the metrics port, and the rendered rows from
 `zig-out/bin/fail2zig --socket <path> status` (the non-root daemon
-admits its own uid as an IPC peer, QA-004). A rejected peer fails the test
+admits its own uid as an IPC peer). A rejected peer fails the test
 outright. They assert on the stable strings
 (`no usable backend`, `refusing to run unprotected`,
 `running DEGRADED as log-only`, a non-empty `protection_cause`), not on
@@ -49,7 +49,7 @@ the cause token. Its
 `LiveDaemon` helper pumps the daemon's stderr on a thread so a test can
 wait for a log line (`would-ban:`) while the process is still running.
 
-The same file carries the ENH-007 / ENH-008 process-level coverage, because
+The same file carries the forced-backend and metrics-off process-level coverage, because
 those scenarios reuse `Scenario`, `LiveDaemon` and the empty-`PATH`
 environment trick (ipset/iptables are probed by `PATH` lookup, so an empty
 `PATH` makes a forced ipset/iptables deterministically unusable at any uid):

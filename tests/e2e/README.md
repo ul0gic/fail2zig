@@ -9,7 +9,7 @@ Not part of the local aggregate: it needs a real systemd host and root.
 
 ## Why this exists
 
-SYS-019 was a CRITICAL regression: the daemon crash-looped under its own
+An earlier release had a critical regression: the daemon crash-looped under its own
 shipped unit. A daemon-side `chown` is a `@privileged` syscall that the
 unit's `SystemCallFilter=~@privileged` SIGSYS-kills, and `CAP_CHOWN` is not
 in the bounding set — so the chown could never succeed anyway. The fix
@@ -31,7 +31,7 @@ can never silently reship.
 ## What it asserts
 
 1. Service reaches `active (running)` with `NRestarts=0` (a non-zero
-   restart count is the crash-loop signature of SYS-019).
+   restart count is the crash-loop signature).
 2. **No** `SIGSYS` / seccomp / chown markers in the service's **current**
    systemd invocation — scoped via `_SYSTEMD_INVOCATION_ID`, never `-b`
    (boot history may contain pre-fix crash-loops, which would
@@ -39,7 +39,7 @@ can never silently reship.
 3. `/run/fail2zig` is `fail2zig:fail2zig` `0750`. The shipped unit ships
    `RuntimeDirectoryMode=0710` — that is only the transient pre-daemon
    value; the daemon chmods the directory to `0750` at startup (the
-   `fchmodat` in `ensureSocketDir` kept by the SYS-019 fix). The harness
+   `fchmodat` in `ensureSocketDir` kept by the fix for that regression). The harness
    checks **steady state** after the service is active, so `0750` is the
    correct invariant.
 4. Socket `/run/fail2zig/fail2zig.sock` is `fail2zig:fail2zig` `0660`.
@@ -152,7 +152,7 @@ backend.
 `deploy_regression.sh` (above) is one of several real-system harnesses here:
 
 - **`deploy_status_honesty.sh`** — asserts the status rollup, resolved-source
-  labels, and persisted lifetime-ban surface (SYS-017, BUG-006).
+  labels, and persisted lifetime-ban surface.
 - **`degraded_file_source.sh`** — runs the shipped binary in `--foreground`
   with one enforcing file jail, rotates and recreates the source, writes new
   failures only to the replacement inode, and requires a confirmed ban plus a
@@ -172,9 +172,9 @@ backend.
   of the live config with `backend = "systemd"` (exit 0, `source=journald`,
   deprecation warning); an unknown key injected at a known line reported as
   `file:line:col`; the live config `chmod 0666` → the unit fails closed with the
-  SEC-012 cause in its invocation's journal, then `0640` restored → active with
-  `NRestarts=0`; `state_file` under `/run` → the SYS-021 warning; and no Zig
-  error-return-trace in either invocation's journal (DBT-005). Bounces the
+  world-writable cause in its invocation's journal, then `0640` restored → active with
+  `NRestarts=0`; `state_file` under `/run` → the tmpfs warning; and no Zig
+  error-return-trace in either invocation's journal. Bounces the
   service and restores config bytes, mode and owner on every exit path. Run on
   the box as root after `deploy_regression.sh` has installed:
 
@@ -184,10 +184,9 @@ backend.
 
 ## Firewall cause distinction
 
-The probe→cause logic is covered by inline tests tagged `SYS-014`
-(`backend.zig`: kernel-absent fall-through, transient fall-through, fail-closed;
-`netlink.zig`: `ProtocolUnsupported` mapping; `nftables.zig`: `probeAvailable` ↔
-`probeReason`). The one path `zig build test` cannot assert is the
+The probe→cause logic is covered by the probe cases in
+`tests/component/nftables_inline_tests.zig` (`probeAvailable` ↔ `probeReason`,
+and each netlink init and GETGEN failure mapped to its cause). The one path `zig build test` cannot assert is the
 **missing-CAP_NET_ADMIN** message — it only fires when a real privileged netlink
 op is denied, and the cause is a `std.log` line. Verify manually:
 

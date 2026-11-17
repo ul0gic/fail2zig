@@ -459,7 +459,7 @@ fn expectRefusal(a: std.mem.Allocator, fx: *Fixture, stderr_needle: []const u8) 
     try expectNoSocket(&fx.h);
 }
 
-test "lifecycle: BUG-026 startup refusal reaches the file log before exit" {
+test "lifecycle: startup refusal reaches the file log before exit" {
     const a = t.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit(a);

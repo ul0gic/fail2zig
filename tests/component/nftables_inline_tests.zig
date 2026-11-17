@@ -65,7 +65,7 @@ test "nftables: NFT_MSG ids match kernel header" {
     try std.testing.expectEqual(@as(u16, 14), NFT_MSG.DELSETELEM);
 }
 
-test "nftables: attribute ids match kernel header (SYS-004 regression)" {
+test "nftables: attribute ids match kernel header (regression)" {
     try std.testing.expectEqual(@as(u16, 11), NFTA_SET.TIMEOUT);
     try std.testing.expectEqual(@as(u16, 4), NFTA_SET_ELEM.TIMEOUT);
     try std.testing.expectEqual(@as(u16, 1), NFTA_SET_ELEM.KEY);
@@ -238,7 +238,7 @@ test "nftables: buildDropRulePayload references set and emits drop verdict" {
     try std.testing.expect(saw_immediate_expr);
 }
 
-test "nftables: buildDropRulePayload emits meta+cmp nfproto guard (SYS-006 regression)" {
+test "nftables: buildDropRulePayload emits meta+cmp nfproto guard (regression)" {
     var buf: [1024]u8 = undefined;
     const out_v4 = try buildDropRulePayload(
         &buf,
@@ -323,7 +323,7 @@ test "nftables: buildDropRulePayload IPv6 uses offset=8 and len=16" {
     try std.testing.expect(saw_len);
 }
 
-test "nftables: buildSetPayload omits NFTA_SET_TIMEOUT when timeout is 0 (SYS-003 regression)" {
+test "nftables: buildSetPayload omits NFTA_SET_TIMEOUT when timeout is 0 (regression)" {
     var buf: [256]u8 = undefined;
     const out = try buildSetPayload(
         &buf,
@@ -568,36 +568,36 @@ test "nftables: isAvailable on zeroed struct reports probeAvailable result" {
     try std.testing.expectEqual(probeAvailable(), got);
 }
 
-test "nftables: probeAvailable agrees with probeReason (SYS-014)" {
+test "nftables: probeAvailable agrees with probeReason" {
     const reason = probeReason();
     try std.testing.expectEqual(reason == .available, probeAvailable());
 }
 
-test "nftables: probe maps each netlink init failure to its cause (SYS-014)" {
+test "nftables: probe maps each netlink init failure to its cause" {
     try std.testing.expectEqual(ProbeResult.kernel_unsupported, probeReasonFromInitError(error.ProtocolUnsupported));
     try std.testing.expectEqual(ProbeResult.permission_denied, probeReasonFromInitError(error.PermissionDenied));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.SocketFailed));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.Timeout));
 }
 
-test "nftables: probe maps each GETGEN ack failure to its cause (SYS-022)" {
+test "nftables: probe maps each GETGEN ack failure to its cause" {
     try std.testing.expectEqual(ProbeResult.permission_denied, probeReasonFromAckError(error.PermissionDenied));
     try std.testing.expectEqual(ProbeResult.kernel_unsupported, probeReasonFromAckError(error.InvalidArgument));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromAckError(error.Timeout));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromAckError(error.NetlinkError));
 }
 
-test "nftables: netlink EPERM maps to BackendError.PermissionDenied (SYS-022)" {
+test "nftables: netlink EPERM maps to BackendError.PermissionDenied" {
     try std.testing.expectEqual(backend.BackendError.PermissionDenied, mapNetlinkErr(error.PermissionDenied));
     try std.testing.expectEqual(backend.BackendError.NotAvailable, mapNetlinkErr(error.ProtocolUnsupported));
 }
 
-test "nftables: probe without CAP_NET_ADMIN reports permission_denied (SYS-022)" {
+test "nftables: probe without CAP_NET_ADMIN reports permission_denied" {
     if (testHasCapNetAdmin()) return error.SkipZigTest;
     try std.testing.expectEqual(ProbeResult.permission_denied, probeReason());
 }
 
-test "nftables: probe with CAP_NET_ADMIN never reports permission_denied (SYS-022)" {
+test "nftables: probe with CAP_NET_ADMIN never reports permission_denied" {
     if (!testHasCapNetAdmin()) return error.SkipZigTest;
     try std.testing.expect(probeReason() != .permission_denied);
 }
