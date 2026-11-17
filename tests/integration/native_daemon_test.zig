@@ -489,7 +489,8 @@ test "native daemon: file retry history and original decision deadline survive g
     try t.expectEqual(@as(usize, 16), try state.readAll(&header));
     try t.expectEqualStrings("SQLite format 3\x00", &header);
     var sidecar_buffer: [4096]u8 = undefined;
-    const sidecar = try engine.journald_source_mod.cursorPath(h.state_path, &sidecar_buffer);
+    const state_dir = std.fs.path.dirname(h.state_path) orelse ".";
+    const sidecar = try std.fmt.bufPrint(&sidecar_buffer, "{s}/journald-cursors.bin", .{state_dir});
     try t.expectError(error.FileNotFound, std.fs.cwd().access(sidecar, .{}));
 }
 

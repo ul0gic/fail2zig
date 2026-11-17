@@ -342,11 +342,6 @@ pub const Harness = struct {
         const ip_str = std.fmt.bufPrint(&ipbuf, "{}", .{ip}) catch return error.UnexpectedResponse;
         return std.mem.indexOf(u8, payload, ip_str) != null;
     }
-
-    pub fn expectRoot() HarnessError!void {
-        const geteuid_rc = std.os.linux.geteuid();
-        if (geteuid_rc != 0) return error.NotRoot;
-    }
 };
 
 fn dialOnce(path: []const u8) !posix.fd_t {

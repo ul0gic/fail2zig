@@ -20,7 +20,6 @@ fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_lite
 }
 
 pub const event_loop_mod = @import("platform/event_loop.zig");
-pub const journald_source_mod = @import("source/journald_source.zig");
 pub const native_store_mod = @import("store/store.zig");
 pub const firewall_scope_mod = @import("firewall/scope.zig");
 pub const native_action_outcome_mod = @import("effect/action_outcome.zig");

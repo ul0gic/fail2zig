@@ -4,7 +4,6 @@
 // Holds: Lifecycle claims come from datagrams on a private NOTIFY_SOCKET, and a notification that must not be sent fails expectSilence.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const harness = @import("harness.zig");
