@@ -76,12 +76,17 @@ namespaces beside the installed service:
   also manual ban and unban, overlapping ownership across a restart, an IPv6 ban
   and a daemon with metrics disabled.
 
-Not run: cutting the installed service over to this release under the shipped
-unit, and an upgrade of a populated state. The state format and the upgrade steps
-are those of 0.4.10. The suites above ran on a build that preceded the last
-change to the plain `history` reader; that change has the local suite and the
-pruned-history case in a local namespace behind it. A prune forced between two
-pages of one `history` read was not exercised.
+An installed v0.4.9 service with sixteen jails and 5,000 bans was then upgraded
+to this release with the installer under the shipped unit. It took the schema 29
+step with its backup, started in 20 seconds with every ban in the kernel, applied
+and lifted a manual ban, answered `history` with no cursor on a state whose first
+9,689 records had been pruned, and restarted with all 5,000 bans still in the
+kernel and no service restart counted.
+
+The namespace suites ran on a build that preceded the last change to the plain
+`history` reader; the upgrade run used the final code. Not run: an upgrade from
+v0.4.10 itself, which needs no state change; a host reboot; and a prune forced
+between two pages of one `history` read.
 
 # fail2zig v0.4.10
 
