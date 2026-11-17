@@ -234,16 +234,6 @@ pub const Jail = struct {
     reservation: ?resource.Token = null,
 };
 
-const PendingWithdrawal = struct {
-    name: [64]u8,
-    name_len: u8,
-    generation: [32]u8,
-    bans_lifted: u32,
-    pub fn jailName(self: *const PendingWithdrawal) []const u8 {
-        return self.name[0..self.name_len];
-    }
-};
-
 pub const OwnerRange = struct { start: usize = 0, len: usize = 0 };
 pub const PublishedRetryPool = struct { sample: ?durable.Store.RetryPoolSample = null, pending: bool = true };
 
@@ -572,7 +562,6 @@ pub const Coordinator = struct {
     published_config_digest: [32]u8 = [_]u8{0} ** 32,
     generation_admitted: bool = false,
     jail_storage: []Jail = &.{},
-    pending_withdrawals: std.ArrayListUnmanaged(PendingWithdrawal) = .{},
     self_addresses: ?shared.self_addresses.SelfAddresses = null,
     metrics_state: metrics_mod.Metrics = .{},
     published_pool: PublishedRetryPool = .{},
@@ -1402,44 +1391,8 @@ pub const Coordinator = struct {
             }
         }
     }
-    fn ownedGeneration(self: *Coordinator, name: []const u8) !?[32]u8 {
-        if (self.owner_scratch.len == 0 or try self.store.readInstallation() == null) return null;
-        for ([_]shared.types.Origin{ .detection, .manual, .config }) |origin| {
-            if (try self.store.ownersByOrigin(origin, name, self.owner_scratch) == 0) continue;
-            const owner = try self.store.currentOwner(self.owner_scratch[0].key, name) orelse continue;
-            return owner.generation;
-        }
-        return null;
-    }
-    fn queueWithdrawal(self: *Coordinator, name: []const u8, generation: ?[32]u8, bans_lifted: u32) !void {
-        logJailRemoved(name, bans_lifted);
-        const selected = generation orelse return;
-        var pending = PendingWithdrawal{ .name = [_]u8{0} ** 64, .name_len = @intCast(name.len), .generation = selected, .bans_lifted = bans_lifted };
-        @memcpy(pending.name[0..name.len], name);
-        try self.pending_withdrawals.append(self.allocator, pending);
-    }
     fn logJailRemoved(name: []const u8, bans_lifted: u32) void {
         std.log.info("native: jail={} removed: {d} bans lifted", .{ std.zig.fmtEscapes(name), bans_lifted });
-    }
-    fn withdrawRetiredJails(self: *Coordinator) !void {
-        if (comptime build_options.diag) diag_mod.gauge(.withdraw_pending, self.pending_withdrawals.items.len);
-        var index: usize = 0;
-        while (index < self.pending_withdrawals.items.len) {
-            const pending = &self.pending_withdrawals.items[index];
-            if (self.effects) |manager| switch (manager.retireJail(pending.jailName(), pending.generation)) {
-                .idle => {},
-                .fatal => |failure| return failure,
-                .progress, .wait, .stop => {
-                    index += 1;
-                    continue;
-                },
-            };
-            _ = self.pending_withdrawals.orderedRemove(index);
-            if (comptime build_options.diag) {
-                diag_mod.count(.withdraw_completed, 1);
-                diag_mod.gauge(.withdraw_pending, self.pending_withdrawals.items.len);
-            }
-        }
     }
     fn rekeySavedGenerations(self: *Coordinator) !void {
         var rekeyed_jails: u32 = 0;
@@ -3264,7 +3217,6 @@ pub const Coordinator = struct {
                 };
             }
         }
-        try self.withdrawRetiredJails();
         if (try self.retireRemovedJail()) return;
         try self.advanceDisabledJails();
         try self.applyBanLists();
@@ -3700,7 +3652,6 @@ pub const Coordinator = struct {
             arena.deinit();
             self.allocator.destroy(arena);
         }
-        self.pending_withdrawals.deinit(self.allocator);
         if (self.self_addresses) |*list| list.deinit(self.allocator);
         self.allocator.free(self.decision_scratch);
         if (self.owner_scratch.len != 0) self.allocator.free(self.owner_scratch);

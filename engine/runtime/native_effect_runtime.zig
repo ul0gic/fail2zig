@@ -1785,69 +1785,6 @@ pub const Manager = struct {
         const held = self.inventory.?;
         return .{ .verified = .{ .intent = intent, .verification = .{ .observed = .{ .installation = self.installation.id, .effect_revision = @intCast(revision), .publication_epoch = epoch, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us } } } };
     }
-    pub fn retireJail(self: *Manager, jail: []const u8, generation: [32]u8) Step {
-        return self.retireJailInner(jail, generation) catch |failure| .{ .fatal = failure };
-    }
-    fn retireJailInner(self: *Manager, jail: []const u8, generation: [32]u8) !Step {
-        errdefer |failure| {
-            self.dropInventory();
-            self.status.ready = false;
-            self.status.uncertain = true;
-            self.status.cause = failure;
-        }
-        if (comptime build_options.diag) diag_mod.gauge(.withdraw_wait_reason, 0);
-        if (self.withdrawn) return .idle;
-        if (self.stopping or !self.admitted or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) {
-            if (comptime build_options.diag) diag_mod.gauge(.withdraw_wait_reason, if (self.stopping) @as(u64, 1) else if (!self.admitted) 2 else if (self.cached_epoch == null) 3 else 4);
-            return .progress;
-        }
-        if (self.readback_wait != 0) {
-            if (comptime build_options.diag) diag_mod.gauge(.withdraw_wait_reason, 5);
-            return .{ .wait = self.waitDue() };
-        }
-        const sampled = try self.clock();
-        if (!self.inventoryCurrent()) {
-            if (comptime build_options.diag) diag_mod.gauge(.withdraw_wait_reason, 6);
-            return self.readback(sampled);
-        }
-        const selector: RetirementSelector = .{ .generation = .{ .jail = jail, .generation = generation } };
-        var tokens: [firewall.max_withdraw_messages]firewall.DispatchToken = undefined;
-        var batched: usize = 0;
-        var budget: usize = 0;
-        var in_flight = false;
-        {
-            var owners: [effect.max_page]effect.Owner = undefined;
-            try self.store.beginRead();
-            errdefer self.store.rollback();
-            for (self.live[0..self.count], 0..) |entry, index| {
-                if (entry.desired != .absent) continue;
-                if (!try presentIn(&self.inventory.?, entry)) continue;
-                const owner_count = try self.store.readOwners(entry.scope_key, &owners);
-                for (owners[0..owner_count]) |owner| {
-                    if (selector.matches(owner)) break;
-                } else continue;
-                if (entry.status == .dispatched or self.markers[index] != null) {
-                    in_flight = true;
-                    continue;
-                }
-                const cost = try firewall.withdrawCost(entry.scope.canonical);
-                if (batched != 0 and budget + cost > firewall.max_withdraw_messages) break;
-                tokens[batched] = self.token(entry, .absent);
-                batched += 1;
-                budget += cost;
-                if (batched == tokens.len) break;
-            }
-            try self.store.commitTransaction();
-        }
-        if (batched == 0) {
-            if (in_flight and !self.events_subscribed) {
-                if (comptime build_options.diag) diag_mod.gauge(.withdraw_wait_reason, 7);
-                return .progress;
-            }
-            return .idle;
-        }
-        return self.withdrawTokens(tokens[0..batched], sampled);
-    }
     fn withdrawTokens(self: *Manager, tokens: []const firewall.DispatchToken, sampled: effect.Clock) !Step {
         self.status.ready = false;
         const sent_ns = self.monotonic(self.monotonic_context);

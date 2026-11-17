@@ -6,7 +6,6 @@
 const std = @import("std");
 const config = @import("fail2ban.zig");
 const policy = @import("../core/source_policy.zig");
-const journal = @import("../core/journal_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Parameter = struct { name: []const u8, value: []const u8 };

@@ -30,7 +30,6 @@ The endpoints are read-only and carry no ban list.
 | `/api/status` | 200, `application/json`. The daemon status with paths and addresses redacted.              |
 | `/api/health` | 200 when ready, 503 when not, `application/json`.                                          |
 | `/api/bans`   | 403, `text/plain`. Ban details are served only through the socket to an administrator.     |
-| `/events`     | 400 `websocket not enabled`. The WebSocket event stream is not available in this release.  |
 | anything else | 404 `not found`.                                                                           |
 
 ```bash

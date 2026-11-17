@@ -93,8 +93,7 @@ Mode 0660; group
 if that group exists.
 .TP
 .B websocket_max_clients
-Integer (1–1024). Accepted and range-checked, with no effect: this release
-serves no WebSocket stream. Default: 16.
+Integer. Deprecated: accepted and ignored with a warning. Remove it from the file.
 .TP
 .B state_file
 String (absolute path). Durable SQLite database containing source positions,
@@ -208,9 +207,7 @@ The server exposes
 and
 .IR /api/health .
 .I /api/bans
-returns 403 and
-.I /events
-returns 400, because this release serves no WebSocket stream.
+returns 403.
 0 is rejected; it does not disable the endpoint. Use
 .BR "metrics_enabled = false" .
 .TP

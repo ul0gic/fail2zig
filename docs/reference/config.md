@@ -172,12 +172,11 @@ state or source positions.
 | <span id="metrics_enabled"></span>`metrics_enabled`             | Boolean, `true`           | `false` removes the HTTP listener; the socket and protection remain available. |
 | <span id="metrics_bind"></span>`metrics_bind`                   | IPv4 string, `"127.0.0.1"` | Listen address, IPv4 only. Loopback is not authentication.                     |
 | <span id="metrics_port"></span>`metrics_port`                   | Integer `1–65535`, `9100` | Port remains validated even when disabled. Zero does not disable HTTP.         |
-| <span id="websocket_max_clients"></span>`websocket_max_clients` | Integer `1–1024`, `16`    | Accepted and range-checked, with no effect: this release serves no WebSocket.  |
+| <span id="websocket_max_clients"></span>`websocket_max_clients` | Integer                   | Deprecated: accepted and ignored with a warning. Remove it from the file.      |
 
 Endpoints are `/metrics`, `/api/status` and `/api/health`. Health reports
 readiness with HTTP 200/503. `/api/bans` returns 403: ban details are served only
-to administrators through the local socket. `/events` returns 400; the WebSocket
-event stream is not available in this release. The
+to administrators through the local socket. The
 [monitoring API reference](api.md) lists every endpoint, field and metric. HTTP shares the privileged daemon
 process. Keep external access controlled or disable it if unused.
 

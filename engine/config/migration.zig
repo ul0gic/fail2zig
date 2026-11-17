@@ -413,7 +413,7 @@ pub fn renderToml(cfg: *const native.Config, w: anytype) !void {
     try w.print("memory_ceiling_mb = {d}\n", .{cfg.global.memory_ceiling_mb});
     try writeQuoted(w, "metrics_bind", cfg.global.metrics_bind);
     try w.print("metrics_port = {d}\n", .{cfg.global.metrics_port});
-    try w.print("metrics_enabled = {s}\nwebsocket_max_clients = {d}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n", .{ if (cfg.global.metrics_enabled) "true" else "false", cfg.global.websocket_max_clients, @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) });
+    try w.print("metrics_enabled = {s}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n", .{ if (cfg.global.metrics_enabled) "true" else "false", @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) });
     try w.writeAll("\n");
 
     try w.writeAll("[defaults]\n");

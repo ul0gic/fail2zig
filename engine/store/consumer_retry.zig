@@ -918,32 +918,6 @@ pub fn Methods(comptime Store: type) type {
             return result;
         }
 
-        fn validateOwners(self: *Store, names: []const []const u8, manifests: ?[]const consumers.Manifest) !void {
-            if (names.len == 0 or names.len > 64) return error.InvalidRecord;
-            try self.beginRead();
-            errdefer self.rollback();
-            if (manifests) |required| {
-                try self.requireManifestSchema();
-                if (required.len > 4096) return error.ConsumerCapacity;
-                if (try self.integer("SELECT count(*) FROM consumer_manifests;") != required.len) return error.ConsumerManifestMismatch;
-                for (required, 0..) |manifest, i| {
-                    for (required[0..i]) |prior| if (std.mem.eql(u8, prior.jail, manifest.jail) and std.mem.eql(u8, prior.source, manifest.source)) return error.ConsumerManifestMismatch;
-                    if (!std.mem.eql(u8, manifest.jail, "@shared") and !Store.canonicalHistoryManifest(manifest)) {
-                        for (names) |name| {
-                            if (std.mem.eql(u8, name, manifest.jail)) break;
-                        } else return error.UnconfiguredStateOwner;
-                    }
-                    const status = try self.checkManifest(manifest);
-                    for (manifest.required) |requirement| try self.checkRequiredState(requirement, status == .first_use);
-                }
-                if (try self.integer("SELECT EXISTS(SELECT 1 FROM consumer_checkpoints c WHERE NOT EXISTS(SELECT 1 FROM consumer_requirements r WHERE r.kind=c.kind AND r.jail=c.jail AND r.source=c.source AND r.rule=c.rule AND r.generation=c.generation AND r.format=c.format));") != 0) return error.ConsumerManifestMismatch;
-            } else if (try self.integer("PRAGMA user_version;") >= 10 and
-                try self.integer("SELECT EXISTS(SELECT 1 FROM consumer_checkpoints);") != 0)
-                return error.NativeConsumersNotIntegrated;
-            try self.validateOwnerNamesTx(names);
-            try self.commitTransaction();
-        }
-
         pub fn validateRuntimeOwnerNames(self: *Store, names: []const []const u8) !void {
             if (names.len == 0 or names.len > 64) return error.InvalidRecord;
             try self.beginRead();

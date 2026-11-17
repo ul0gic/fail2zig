@@ -17,7 +17,6 @@ const retry = @import("../core/native_retry.zig");
 const effect_runtime = @import("native_effect_runtime.zig");
 const inspection = @import("../firewall/inspection.zig");
 const timezone = @import("../core/native_timezone.zig");
-const rules = @import("../core/native_rules.zig");
 const ipc = @import("../net/ipc.zig");
 const http = @import("../net/http.zig");
 const shared = @import("shared");

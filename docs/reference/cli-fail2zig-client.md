@@ -409,8 +409,7 @@ printing the status when the loss-event query fails.
 The daemon also serves read-only monitoring over HTTP, by default on
 `127.0.0.1:9100`: `/metrics` for Prometheus, `/api/status` and `/api/health`.
 There is no authentication; the bind address is the only access control.
-`/api/bans` returns 403, and `/events` returns 400 because this release serves no
-WebSocket stream. `metrics_enabled = false` removes the listener while the socket
+`/api/bans` returns 403. `metrics_enabled = false` removes the listener while the socket
 stays available.
 
 ```bash

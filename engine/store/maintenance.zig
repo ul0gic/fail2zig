@@ -11,7 +11,6 @@ const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
 const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
-const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const health = @import("../core/storage_health.zig");
 const recurrence = @import("../core/native_recurrence.zig");

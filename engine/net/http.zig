@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-// Does:  Serves the metrics, status and health endpoints over HTTP/1.1 and hands /events upgrades to the WebSocket server.
-// Holds: A connection gets one response to one request of at most 8 KiB, then is closed or handed off; ban details are never served.
+// Does:  Serves the metrics, status and health endpoints over HTTP/1.1.
+// Holds: A connection gets one response to one request of at most 8 KiB and is then closed; ban details are never served.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -10,7 +10,6 @@ const linux = std.os.linux;
 
 const event_loop_mod = @import("../core/event_loop.zig");
 const EventLoop = event_loop_mod.EventLoop;
-const ws_mod = @import("ws.zig");
 
 pub const max_clients: usize = 16;
 pub const max_request_bytes: usize = 8 * 1024;
@@ -87,7 +86,6 @@ pub const HttpServer = struct {
     metrics_source: MetricsSource = .{},
     status_source: StatusSource = .{},
     health_source: StatusSource = .{},
-    ws_server: ?*ws_mod.WsServer = null,
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
     accept_bucket_epoch_s: i64 = 0,
     accept_bucket_count: u32 = 0,
@@ -159,10 +157,6 @@ pub const HttpServer = struct {
     }
     pub fn setStatusSource(self: *HttpServer, s: StatusSource) void {
         self.status_source = s;
-    }
-
-    pub fn setWsServer(self: *HttpServer, server: ?*ws_mod.WsServer) void {
-        self.ws_server = server;
     }
 
     pub fn start(self: *HttpServer) Error!void {
@@ -295,12 +289,9 @@ pub const HttpServer = struct {
             cli.len += n;
 
             // Why: The header section ends at the first empty line (RFC 9112 section 2.1); no request body is ever read.
-            if (std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n\r\n")) |hdr_end| {
-                const outcome = self.respond(cli, hdr_end) catch Outcome.close;
-                switch (outcome) {
-                    .close => self.closeClient(cli),
-                    .handoff => self.releaseClient(cli),
-                }
+            if (std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n\r\n") != null) {
+                self.respond(cli) catch {};
+                self.closeClient(cli);
                 return;
             }
         }
@@ -308,23 +299,20 @@ pub const HttpServer = struct {
         self.closeClient(cli);
     }
 
-    // Does:  Says who owns the fd after a response: close leaves it here to be closed, handoff means the WebSocket server took it.
-    const Outcome = enum { close, handoff };
-
-    fn respond(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
+    fn respond(self: *HttpServer, cli: *ClientReg) !void {
         const req_end = std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n") orelse {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad request\n");
-            return .close;
+            return;
         };
         const request_line = cli.buf[0..req_end];
         const parsed = parseRequestLine(request_line) orelse {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad request line\n");
-            return .close;
+            return;
         };
 
         if (!std.mem.eql(u8, parsed.method, "GET")) {
             try writeSimpleResponse(cli.fd, 405, "Method Not Allowed", "text/plain", "only GET\n");
-            return .close;
+            return;
         }
 
         const path = blk: {
@@ -334,82 +322,20 @@ pub const HttpServer = struct {
 
         if (std.mem.eql(u8, path, "/metrics")) {
             try self.respondMetrics(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/status")) {
             try self.respondStatus(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/health")) {
             try self.respondHealth(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/bans")) {
             try writeSimpleResponse(cli.fd, 403, "Forbidden", "text/plain", "ban details require administrator access through the local socket\n");
-            return .close;
-        } else if (std.mem.eql(u8, path, "/events")) {
-            return self.tryWsUpgrade(cli, hdr_end_idx);
+            return;
         } else {
             try writeSimpleResponse(cli.fd, 404, "Not Found", "text/plain", "not found\n");
-            return .close;
+            return;
         }
-    }
-
-    // Does:  Checks the Upgrade, Connection and Sec-WebSocket-Key fields (RFC 6455 section 4.2.1), replies 101 and hands the socket over.
-    fn tryWsUpgrade(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
-        const ws = self.ws_server orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "websocket not enabled\n");
-            return .close;
-        };
-
-        const req_bytes = cli.buf[0..cli.len];
-        const upgrade_hdr = ws_mod.findHeader(req_bytes, "Upgrade") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "upgrade required\n");
-            return .close;
-        };
-        if (!asciiEqlIgnoreCase(upgrade_hdr, "websocket")) {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad upgrade\n");
-            return .close;
-        }
-        const conn_hdr = ws_mod.findHeader(req_bytes, "Connection") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection: upgrade required\n");
-            return .close;
-        };
-        // Why: Connection is a comma-separated list, so "upgrade" may sit beside other options (RFC 9110 section 7.6.1).
-        if (!asciiContainsIgnoreCase(conn_hdr, "upgrade")) {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection header missing upgrade\n");
-            return .close;
-        }
-        const key = ws_mod.findHeader(req_bytes, "Sec-WebSocket-Key") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "Sec-WebSocket-Key required\n");
-            return .close;
-        };
-
-        var accept_buf: [64]u8 = undefined;
-        const accept = ws_mod.computeAccept(key, &accept_buf) catch {
-            try writeSimpleResponse(cli.fd, 500, "Internal Server Error", "text/plain", "handshake failed\n");
-            return .close;
-        };
-        // Why: The reply is 101 fixed bytes plus the 28-character accept value, so the 256-byte buffer cannot overflow.
-        var hs_buf: [256]u8 = undefined;
-        const hs = std.fmt.bufPrint(
-            &hs_buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: {s}\r\n\r\n",
-            .{accept},
-        ) catch unreachable;
-        writeAll(cli.fd, hs) catch return .close;
-
-        // Why: Bytes read past the header section are the client's first frames and go to the WebSocket server.
-        const tail_start = hdr_end_idx + 4;
-        const tail = if (tail_start <= cli.len) cli.buf[tail_start..cli.len] else cli.buf[0..0];
-
-        self.loop.removeFd(cli.fd) catch {};
-        // Why: admitUpgraded closes the fd on every failure, so the slot is released without a second close.
-        ws.admitUpgraded(cli.fd, tail) catch |err| {
-            std.log.warn("http: ws handoff failed (fd={d}): {s}", .{ cli.fd, @errorName(err) });
-            return .handoff;
-        };
-        return .handoff;
     }
 
     fn respondMetrics(self: *HttpServer, fd: posix.fd_t) !void {
@@ -482,18 +408,6 @@ pub const HttpServer = struct {
         posix.close(cli.fd);
         self.allocator.destroy(cli);
     }
-
-    fn releaseClient(self: *HttpServer, cli: *ClientReg) void {
-        for (&self.clients) |*slot| {
-            if (slot.*) |existing| {
-                if (existing == cli) {
-                    slot.* = null;
-                    break;
-                }
-            }
-        }
-        self.allocator.destroy(cli);
-    }
 };
 
 const RequestLine = struct {
@@ -553,24 +467,6 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
         if (n == 0) return error.ShortWrite;
         written += n;
     }
-}
-
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 fn parseIpv4(s: []const u8) ?u32 {

@@ -117,7 +117,6 @@ pub const GlobalConfig = struct {
     metrics_enabled: bool = true,
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
-    websocket_max_clients: u32 = 16,
     history_retention: shared.Duration = 86_400,
     history_max_matches: u16 = 10,
     on_no_backend: OnNoBackend = .@"fail-closed",
@@ -128,7 +127,6 @@ pub const GlobalConfig = struct {
     dns_port: u16 = 53,
 };
 
-pub const websocket_hard_max_clients: u32 = 1024;
 pub const max_configured_jails: usize = 256;
 
 pub const JailDefaults = struct {
@@ -1383,9 +1381,8 @@ const Parser = struct {
             if (n < 0 or n > 65535) return error.InvalidValue;
             self.global.metrics_port = @intCast(n);
         } else if (std.mem.eql(u8, key, "websocket_max_clients")) {
-            const n = try asInt(v);
-            if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
-            self.global.websocket_max_clients = @intCast(n);
+            _ = try asInt(v);
+            std.log.warn("config: websocket_max_clients is a deprecated compatibility key with no effect; remove it", .{});
         } else if (std.mem.eql(u8, key, "history_retention")) {
             const n = try asInt(v);
             // Why: History pruning multiplies retention into i64 microseconds, so a larger value would overflow there.

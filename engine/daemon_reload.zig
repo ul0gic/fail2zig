@@ -159,12 +159,7 @@ pub fn Methods(comptime Coordinator: type) type {
             // Holds: A jail name still retiring is refused before any jail is built or durable state changes.
             for (proposed.jails) |jail_cfg| if (jail_cfg.enabled) {
                 const runtime_retiring = if (self.findJail(jail_cfg.name)) |jail| jail.retiring else false;
-                var withdrawing = false;
-                for (self.pending_withdrawals.items) |pending| if (std.mem.eql(u8, pending.jailName(), jail_cfg.name)) {
-                    withdrawing = true;
-                    break;
-                };
-                if (runtime_retiring or withdrawing or try self.store.jailRetirement(jail_cfg.name) != null)
+                if (runtime_retiring or try self.store.jailRetirement(jail_cfg.name) != null)
                     return ReloadOutcome.single(.rejected, "jails.{s}: retirement in progress; retry after completion", .{jail_cfg.name});
             };
             const removed = classification.jails.removedSlice();

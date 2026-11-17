@@ -3,7 +3,6 @@
 const std = @import("std");
 const detection = @import("native_detection_record.zig");
 const effect_history = @import("native_effect_history.zig");
-const retry = @import("native_retry.zig");
 
 pub const version: u16 = 1;
 pub const max_page: usize = 64;

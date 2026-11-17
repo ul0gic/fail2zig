@@ -62,12 +62,8 @@ const counter_order: std.builtin.AtomicOrder = .monotonic;
 pub const PerJail = struct {
     name_buf: [max_jail_name_len]u8 = [_]u8{0} ** max_jail_name_len,
     name_len: u8 = 0,
-    lines_parsed: Counter = .{},
-    lines_matched: Counter = .{},
     bans_total: Counter = .{},
-    unbans_total: Counter = .{},
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    parse_errors: Counter = .{},
     failures_counted: Counter = .{},
     ignored_detections: Counter = .{},
     pool_evictions: Counter = .{},
@@ -81,12 +77,8 @@ pub const PerJail = struct {
 pub const PerJailSnapshot = struct {
     name_buf: [max_jail_name_len]u8,
     name_len: u8,
-    lines_parsed: u64,
-    lines_matched: u64,
     bans_total: u64,
-    unbans_total: u64,
     active_bans: u32,
-    parse_errors: u64,
     failures_counted: u64,
     ignored_detections: u64,
     pool_evictions: u64,
@@ -110,13 +102,8 @@ pub const NativeHealth = struct {
 };
 
 pub const Snapshot = struct {
-    lines_parsed: u64 = 0,
-    lines_matched: u64 = 0,
     bans_total: u64 = 0,
-    unbans_total: u64 = 0,
     active_bans: u32 = 0,
-    parse_errors: u64 = 0,
-    memory_bytes_used: u64 = 0,
     state_file_bytes: u64 = 0,
     state_file_pages: u64 = 0,
     state_file_used_pages: u64 = 0,
@@ -141,13 +128,8 @@ pub const Snapshot = struct {
 };
 
 pub const Metrics = struct {
-    lines_parsed: Counter = .{},
-    lines_matched: Counter = .{},
     bans_total: Counter = .{},
-    unbans_total: Counter = .{},
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    parse_errors: Counter = .{},
-    memory_bytes_used: Counter = .{},
     state_file_bytes: Counter = .{},
     state_file_pages: Counter = .{},
     state_file_used_pages: Counter = .{},
@@ -250,13 +232,8 @@ pub const Metrics = struct {
 
     pub fn snapshot(self: *Metrics) Snapshot {
         var s = Snapshot{};
-        s.lines_parsed = self.lines_parsed.load();
-        s.lines_matched = self.lines_matched.load();
         s.bans_total = self.bans_total.load();
-        s.unbans_total = self.unbans_total.load();
         s.active_bans = self.active_bans.load(counter_order);
-        s.parse_errors = self.parse_errors.load();
-        s.memory_bytes_used = self.memory_bytes_used.load();
         s.state_file_bytes = self.state_file_bytes.load();
         s.state_file_pages = self.state_file_pages.load();
         s.state_file_used_pages = self.state_file_used_pages.load();
@@ -276,12 +253,8 @@ pub const Metrics = struct {
             s.jails[i] = .{
                 .name_buf = slot.name_buf,
                 .name_len = slot.name_len,
-                .lines_parsed = slot.lines_parsed.load(),
-                .lines_matched = slot.lines_matched.load(),
                 .bans_total = slot.bans_total.load(),
-                .unbans_total = slot.unbans_total.load(),
                 .active_bans = slot.active_bans.load(counter_order),
-                .parse_errors = slot.parse_errors.load(),
                 .failures_counted = slot.failures_counted.load(),
                 .ignored_detections = slot.ignored_detections.load(),
                 .pool_evictions = slot.pool_evictions.load(),

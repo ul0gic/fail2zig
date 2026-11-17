@@ -4,7 +4,6 @@
 // Holds: Each non-rejected admin request, reload or policy transition raises the mutation revision by one in the transaction recording it.
 
 const std = @import("std");
-const retry = @import("../core/native_retry.zig");
 const effects = @import("../core/native_effect.zig");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
