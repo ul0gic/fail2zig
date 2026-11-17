@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-// Does:  Proves admin commands, jail pause and disable, owner release and migration cutover and rollback against a running daemon.
+// Does:  Proves admin commands, jail pause and disable, owner release, migration cutover and rollback and history after pruning.
 // Holds: Cases that touch firewall rules require a network namespace other than F2Z_NATIVE_PARENT_NETNS, then unshare a fresh one.
 
 const std = @import("std");
@@ -1613,4 +1613,156 @@ test "admin: staged migration owners stay outside authority and a log-only desti
     try t.expectEqual(@as(i64, 5), try store.inspectInteger("SELECT state FROM migration_runs WHERE run_id=x'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5';"));
     try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM effect_owners;"));
     try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM migration_steps WHERE outcome=0;"));
+}
+
+const history_retention_s = 6;
+
+fn writeRetentionConfig(h: *harness.Harness) !void {
+    var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writer().print(
+        \\[global]
+        \\native_ingestion = true
+        \\state_file = "{s}"
+        \\socket_path = "{s}"
+        \\metrics_enabled = false
+        \\firewall = "nftables"
+        \\firewall_namespace = "/proc/{d}/ns/net"
+        \\history_retention = {d}
+        \\[defaults]
+        \\enforce = true
+        \\maxretry = 2
+        \\findtime = 600
+        \\bantime = 600
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "file"
+        \\timestamp = "undated"
+        \\logpath = ["{s}"]
+        \\
+    , .{ h.state_path, h.socket_path, linux.getpid(), history_retention_s, h.log_path });
+}
+
+const HistoryPage = struct {
+    sequences: std.ArrayList(u64),
+    next: ?[]u8,
+    fn deinit(self: *HistoryPage, a: std.mem.Allocator) void {
+        self.sequences.deinit();
+        if (self.next) |cursor| a.free(cursor);
+    }
+};
+
+fn readHistory(a: std.mem.Allocator, h: *harness.Harness, limit: []const u8, cursor: ?[]const u8) !HistoryPage {
+    var args = std.ArrayList([]const u8).init(a);
+    defer args.deinit();
+    try args.appendSlice(&.{ "history", "--limit", limit });
+    if (cursor) |value| try args.appendSlice(&.{ "--cursor", value });
+    const result = try admin(a, h, args.items);
+    defer result.deinit(a);
+    if (result.code != 0) {
+        std.debug.print("history exited {d}: {s}{s}\n", .{ result.code, result.stdout, result.stderr });
+        return error.HistoryFailed;
+    }
+    const doc = try parseValue(a, result.stdout);
+    defer doc.deinit();
+    var page = HistoryPage{ .sequences = std.ArrayList(u64).init(a), .next = null };
+    errdefer page.deinit(a);
+    for (doc.value.object.get("items").?.array.items) |item| try page.sequences.append(@intCast(item.object.get("sequence").?.integer));
+    const next = doc.value.object.get("next_cursor").?;
+    if (next == .string) page.next = try a.dupe(u8, next.string);
+    return page;
+}
+
+fn expectContiguousFrom(first: u64, sequences: []const u64) !void {
+    for (sequences, 0..) |sequence, index| try t.expectEqual(first + index, sequence);
+}
+
+fn banHost(a: std.mem.Allocator, h: *harness.Harness, address: []const u8) !void {
+    const ban = try admin(a, h, &.{ "ban", address, "--jail", "sshd", "--duration", "300" });
+    defer ban.deinit(a);
+    try t.expectEqual(@as(u8, 0), ban.code);
+    try t.expect(std.mem.indexOf(u8, ban.stdout, "\"enforced\":true") != null);
+}
+
+test "kernel: admin: history without a cursor starts at the oldest retained record after retention pruned the first records" {
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
+    const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
+    var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &namespace_buffer);
+    try t.expect(!std.mem.eql(u8, prior, current));
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+
+    const a = t.allocator;
+    std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;
+    var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeRetentionConfig(&h);
+    try h.startDaemon();
+    defer _ = h.stopDaemon() catch {};
+    try waitReady(&h, 10_000);
+
+    try banHost(a, &h, "192.0.2.11");
+    try banHost(a, &h, "192.0.2.12");
+
+    var early: HistoryPage = undefined;
+    var timer = try std.time.Timer.start();
+    while (true) {
+        early = try readHistory(a, &h, "50", null);
+        if (early.sequences.items.len >= 2) break;
+        early.deinit(a);
+        if (timer.read() > 5 * std.time.ns_per_s) return error.TimedOut;
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    defer early.deinit(a);
+    try expectContiguousFrom(1, early.sequences.items);
+    const pruned_through: u64 = early.sequences.items.len;
+    var first_page = try readHistory(a, &h, "1", null);
+    defer first_page.deinit(a);
+    try t.expectEqualSlices(u64, &.{1}, first_page.sequences.items);
+    const stale_cursor = first_page.next orelse return error.MissingNextCursor;
+
+    // Why: Retention removes only records at least history_retention old, so the first two must age before two newer bans arrive.
+    std.time.sleep((history_retention_s * 1000 + 500) * std.time.ns_per_ms);
+    try banHost(a, &h, "192.0.2.13");
+    try banHost(a, &h, "192.0.2.14");
+
+    var retained: HistoryPage = undefined;
+    timer.reset();
+    while (true) {
+        retained = try readHistory(a, &h, "50", null);
+        if (retained.sequences.items.len == 0) return error.RetentionPrunedEveryRecord;
+        if (retained.sequences.items[0] >= pruned_through + 1) break;
+        retained.deinit(a);
+        if (timer.read() > 20 * std.time.ns_per_s) return error.TimedOut;
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    defer retained.deinit(a);
+    try t.expectEqual(pruned_through + 1, retained.sequences.items[0]);
+    try expectContiguousFrom(pruned_through + 1, retained.sequences.items);
+    try t.expect(retained.sequences.items.len >= 2);
+
+    var paged = std.ArrayList(u64).init(a);
+    defer paged.deinit();
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| a.free(value);
+    var pages: usize = 0;
+    while (pages < 32) : (pages += 1) {
+        var page = try readHistory(a, &h, "1", cursor);
+        defer page.deinit(a);
+        if (cursor) |value| a.free(value);
+        cursor = page.next;
+        page.next = null;
+        try paged.appendSlice(page.sequences.items);
+        if (cursor == null) break;
+    }
+    try t.expect(cursor == null);
+    try t.expectEqualSlices(u64, retained.sequences.items, paged.items);
+
+    const stale = try admin(a, &h, &.{ "history", "--limit", "50", "--cursor", stale_cursor });
+    defer stale.deinit(a);
+    try t.expect(stale.code != 0);
+    const answer = try std.mem.concat(a, u8, &.{ stale.stdout, stale.stderr });
+    defer a.free(answer);
+    try t.expect(std.mem.indexOf(u8, answer, "409") != null);
+    try t.expect(std.mem.indexOf(u8, answer, "cursor expired or observation changed; restart pagination without a cursor") != null);
 }
