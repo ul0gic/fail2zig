@@ -920,6 +920,18 @@ pub const Store = struct {
 
     pub usingnamespace @import("maintenance.zig").Methods(@This());
 
+    pub usingnamespace @import("record_cleanup.zig").Methods(@This());
+
+    pub usingnamespace @import("retry_retirement.zig").Methods(@This());
+
+    pub usingnamespace @import("history.zig").Methods(@This());
+
+    pub usingnamespace @import("history_retention.zig").Methods(@This());
+
+    pub usingnamespace @import("action_targets.zig").Methods(@This());
+
+    pub usingnamespace @import("prune.zig").Methods(@This());
+
     pub usingnamespace @import("effects.zig").Methods(@This());
 
     pub usingnamespace @import("consumer_retry.zig").Methods(@This());
