@@ -548,7 +548,7 @@ fn ownerExpiry(items: []const std.json.Value, jail: []const u8) !i64 {
     return error.MissingOwner;
 }
 
-test "admin: BUG-040 nftables network ban list and unban preserve CIDR" {
+test "kernel: admin: BUG-040 nftables network ban list and unban preserve CIDR" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -614,7 +614,7 @@ fn expectKernelHostRules(a: std.mem.Allocator, address: []const u8, expected: us
     try t.expectEqual(expected, count);
 }
 
-test "admin: shared-owner unban preserves finite and permanent protection" {
+test "kernel: admin: shared-owner unban preserves finite and permanent protection" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -824,7 +824,7 @@ fn expectRemainingDisableOwners(probe: *@import("engine").native_store_mod.Store
     try t.expect(std.meta.eql(second, (try probe.currentOwner(keys[1], "sshd")) orelse return error.MissingOwner));
 }
 
-test "admin: a failure after one committed release page is partial and replay-fenced" {
+test "kernel: admin: a failure after one committed release page is partial and replay-fenced" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -951,7 +951,7 @@ fn savedAdminSourceCursor(a: std.mem.Allocator, probe: *@import("engine").native
     return cursor;
 }
 
-test "admin: disabled resume consumes input without decisions and defers configured bans through reload and restart" {
+test "kernel: admin: disabled resume consumes input without decisions and defers configured bans through reload and restart" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1051,7 +1051,7 @@ test "admin: disabled resume consumes input without decisions and defers configu
     try t.expect(!try kernelHas(a, "203.0.113.159"));
 }
 
-test "admin: post-removal settlement failure stays uncertain and reconciles after restart" {
+test "kernel: admin: post-removal settlement failure stays uncertain and reconciles after restart" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1217,7 +1217,7 @@ test "admin: post-removal settlement failure stays uncertain and reconciles afte
     try t.expect(!jail.get("disable_cleanup_pending").?.bool);
 }
 
-test "admin: enforcing manual ban, unban and disable settle only by kernel readback; reload re-key keeps the rule" {
+test "kernel: admin: enforcing manual ban, unban and disable settle only by kernel readback; reload re-key keeps the rule" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1394,22 +1394,35 @@ test "admin: enforcing manual ban, unban and disable settle only by kernel readb
     try t.expectEqualStrings(before_lines, after_lines);
     const before_rows = try ownerDigest(a, h.state_path);
     defer a.free(before_rows);
-    _ = try h.stopDaemon();
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    try waitKernel(a, "198.51.100.7", true, 5000);
+    try t.expect(try kernelHas(a, "192.0.2.10"));
+    const after_stop = try ownerDigest(a, h.state_path);
+    defer a.free(after_stop);
+    try t.expectEqualStrings(before_rows, after_stop);
+
+    var stopped_namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const stopped_namespace = try std.fs.readLinkAbsolute("/proc/self/ns/net", &stopped_namespace_buffer);
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+    var fresh_namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const fresh_namespace = try std.fs.readLinkAbsolute("/proc/self/ns/net", &fresh_namespace_buffer);
+    try t.expect(!std.mem.eql(u8, stopped_namespace, fresh_namespace));
+    const empty_rules = try run(a, &.{ "iptables", "-S" });
+    defer empty_rules.deinit(a);
+    try t.expectEqual(@as(u8, 0), empty_rules.code);
+    try t.expect(std.mem.indexOf(u8, empty_rules.stdout, "-A ") == null);
     waitKernel(a, "198.51.100.7", false, 5000) catch |err| {
         const rules = try run(a, &.{ "iptables", "-S" });
         defer rules.deinit(a);
-        std.debug.print("rules still present after stop:\n{s}\n", .{rules.stdout});
+        std.debug.print("rules present in the fresh network namespace:\n{s}\n", .{rules.stdout});
         return err;
     };
     if (try kernelHas(a, "192.0.2.10")) {
         const rules = try run(a, &.{ "iptables", "-S" });
         defer rules.deinit(a);
-        std.debug.print("192.0.2.10 still realized after stop:\n{s}\n", .{rules.stdout});
+        std.debug.print("192.0.2.10 present in the fresh network namespace:\n{s}\n", .{rules.stdout});
     }
     try t.expect(!try kernelHas(a, "192.0.2.10"));
-    const after_stop = try ownerDigest(a, h.state_path);
-    defer a.free(after_stop);
-    try t.expectEqualStrings(before_rows, after_stop);
     try h.startDaemon();
     try waitStatusFor(&h, "\"state\":\"active\"", 30_000);
     waitKernel(a, "198.51.100.7", true, 20000) catch |err| {

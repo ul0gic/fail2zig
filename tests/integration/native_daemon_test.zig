@@ -381,7 +381,7 @@ fn expectActionTargets(path: []const u8) !void {
     try t.expectEqual(@as(u64, 1), try store.confirmedEffectEvents());
 }
 
-test "native daemon: enforcing source commits targets before ack and restart does not duplicate outcomes" {
+test "kernel: native daemon: enforcing source commits targets before ack and restart does not duplicate outcomes" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -707,7 +707,7 @@ fn waitMalformedCursors(path: []const u8, after_restart: bool) !void {
     return error.TimedOut;
 }
 
-test "native daemon: malformed shared source advances durably and stays ready across restart" {
+test "kernel: native daemon: malformed shared source advances durably and stays ready across restart" {
     const enforcing = std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null;
     if (enforcing) try enterNestedNetworkNamespace();
     var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });

@@ -1996,6 +1996,16 @@ fn payloadAttrs(payload: []const u8, allowed: []const u16) Error!AttrMap {
     if (payload.len < 4 or payload[0] != nl.NFPROTO.INET or payload[1] != 0) return error.UnknownState;
     return AttrMap.parse(payload[4..], allowed);
 }
+fn nftSetAttrs(payload: []const u8) Error!AttrMap {
+    const attrs = try payloadAttrs(payload, &.{ 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 16, 19, 20 });
+    if (attrs.values[19] != null) {
+        _ = try attrs.text(19);
+    }
+    if (attrs.values[20] != null) {
+        _ = try attrs.number(u32, 20);
+    }
+    return attrs;
+}
 fn equalAttributes(a: []const u8, b: []const u8, depth: usize, optional_zero_attr: ?u16) Error!bool {
     if (depth > 16) return error.LimitExceeded;
     var ai = nl.Attributes{ .bytes = a };
@@ -2108,7 +2118,7 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
         defer sets.deinit();
         var seen = [_]bool{ false, false };
         for (sets.values.items) |payload| {
-            const a = try payloadAttrs(payload, &.{ 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 16 });
+            const a = try nftSetAttrs(payload);
             if (!mem.eql(u8, try a.text(1), name)) continue;
             const set = try a.text(2);
             const index: usize = if (mem.eql(u8, set, "banned_ipv4")) 0 else if (mem.eql(u8, set, "banned_ipv6")) 1 else return error.ForeignState;
@@ -2189,6 +2199,7 @@ pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const builderFinish = Self.Builder.finish;
     pub const tokensParse = Self.Tokens.parse;
     pub const attrMapParse = Self.AttrMap.parse;
+    pub const nftSetAttrs = Self.nftSetAttrs;
     pub const buildFixedScopedArgv = Self.buildFixedScopedArgv;
     pub const parseIptables = Self.parseIptables;
     pub const parseIpset = Self.parseIpset;

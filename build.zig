@@ -30,7 +30,7 @@ const NoDiagCheck = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const integration_filter = b.option([]const u8, "test-filter", "Run only integration tests whose names contain this text");
+    const integration_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
     const strip = b.option(bool, "strip", "Strip debug information from the executable") orelse false;
     const diag = b.option(bool, "diag", "Build the internal diagnostic instrumentation; never shipped") orelse false;
     if (diag) if (releaseSignal(b, strip)) |signal| {
@@ -203,7 +203,7 @@ pub fn build(b: *std.Build) void {
         });
         module.addImport("shared", shared_mod);
         module.addImport("engine_test", component_api);
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry.filter} });
+        const tests = b.addTest(.{ .root_module = module, .filters = if (integration_filter) |value| &.{value} else &.{entry.filter} });
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
         firewall_step.dependOn(&run_tests.step);

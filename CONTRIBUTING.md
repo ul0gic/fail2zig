@@ -67,9 +67,11 @@ live firewall enforcement on every supported architecture. Use an isolated test
 machine or namespace for tests that change firewall state.
 
 Local checks are optional conveniences, not substitutes for required CI.
-Formatting, shell/YAML checks, workflow security
-analysis, maintained test suites and five release cross-builds run where
-applicable. See [CI](.github/workflows/ci.yml) for the exact checks.
+PR CI owns source, security and product qualification; ordinary merges do not
+repeat it. Full PR runs publish a tested x86_64 candidate and SHA-256. Release
+workflows build the five targets in GitHub and publish the verified package after
+approval. See [CI and releases](docs/operations/releases.md) for selection, kernel
+coverage, hashes and the release procedure.
 
 ## Filing an issue
 

@@ -1,0 +1,48 @@
+name: Pinned Zig toolchain
+description: Verify the compiler archive and cache compilation by target.
+inputs:
+  directory:
+    description: Source checkout directory
+    default: .
+  target:
+    description: Compilation target used to isolate caches
+    default: x86_64-linux-musl
+  cache:
+    description: Cache compiler output
+    default: "true"
+outputs:
+  executable:
+    description: Verified compiler executable
+    value: ${{ steps.install.outputs.executable }}
+  version:
+    description: Pinned compiler version
+    value: ${{ steps.install.outputs.version }}
+  sha256:
+    description: Verified compiler archive digest
+    value: ${{ steps.install.outputs.sha256 }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      working-directory: ${{ inputs.directory }}
+      run: |
+        version=$(jq -er .version .github/zig.json)
+        digest=$(jq -er .sha256 .github/zig.json)
+        [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $digest =~ ^[0-9a-f]{64}$ ]]
+        archive="$RUNNER_TEMP/zig.tar.xz"
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://ziglang.org/download/$version/zig-x86_64-linux-$version.tar.xz" -o "$archive"
+        printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict
+        mkdir -p "$RUNNER_TEMP/zig"
+        tar -xf "$archive" -C "$RUNNER_TEMP/zig" --strip-components=1
+        test "$("$RUNNER_TEMP/zig/zig" version)" = "$version"
+        printf 'executable=%s/zig/zig\n' "$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
+        printf 'version=%s\nsha256=%s\n' "$version" "$digest" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      if: inputs.cache == 'true'
+      with:
+        path: ${{ inputs.directory }}/.zig-cache
+        key: zig-v3-${{ runner.os }}-${{ steps.install.outputs.sha256 }}-${{ inputs.target }}-${{ github.sha }}
+        restore-keys: |
+          zig-v3-${{ runner.os }}-${{ steps.install.outputs.sha256 }}-${{ inputs.target }}-
