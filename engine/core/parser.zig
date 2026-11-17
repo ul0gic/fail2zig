@@ -4,8 +4,6 @@
 const std = @import("std");
 const shared = @import("shared");
 
-pub const matcher = @import("matcher.zig");
-
 pub const ParseResult = struct {
     ip: shared.IpAddress,
     timestamp: ?shared.Timestamp = null,

@@ -166,6 +166,13 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run.addArgs(args);
         b.step(b.fmt("probe-{s}", .{probe.name}), "Run a manual diagnostic probe").dependOn(&run.step);
     }
+    const unreferenced = b.addExecutable(.{ .name = "f2z-unreferenced", .root_module = b.createModule(.{ .root_source_file = b.path("scripts/unreferenced.zig"), .target = b.graph.host, .optimize = .Debug }) });
+    const run_unreferenced = b.addRunArtifact(unreferenced);
+    run_unreferenced.setCwd(b.path("."));
+    run_unreferenced.addArgs(&.{ "build.zig", "engine", "client", "shared", "tests" });
+    if (b.args) |args| run_unreferenced.addArgs(args);
+    b.step("unreferenced", "List files nothing imports and declarations nothing refers to").dependOn(&run_unreferenced.step);
+
     const load_fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/harness/load_repro/fixture.zig"),
         .target = target,

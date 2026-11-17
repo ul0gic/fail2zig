@@ -3,7 +3,6 @@
 // Does:  Bounds the state-file pages each kind of write can add and admits or refuses intake against the capacity line.
 // Holds: Intake that would take used plus owed pages past 262,144 is refused, and after a refusal reopens only 1,024 pages lower.
 
-const std = @import("std");
 const shared = @import("shared");
 const store = @import("store.zig");
 const effects = @import("../core/native_effect.zig");

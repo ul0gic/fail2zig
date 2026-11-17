@@ -4,7 +4,6 @@
 // Holds: Text passed through renderDiagnostic or writeEscaped carries no C0, DEL, C1 or bidirectional control codepoint to the terminal.
 
 const std = @import("std");
-const shared = @import("shared");
 const args = @import("args.zig");
 
 pub const OutputFormat = args.OutputFormat;

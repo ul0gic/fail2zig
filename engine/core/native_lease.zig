@@ -95,13 +95,3 @@ pub const Schedule = union(enum) {
         };
     }
 };
-
-pub const ClockFence = struct {
-    wall_us: i64,
-    monotonic_us: u64,
-
-    pub fn advance(self: *ClockFence, sample: ClockSample) Error!void {
-        if (sample.wall_us < self.wall_us or sample.monotonic_us < self.monotonic_us) return error.ClockReversed;
-        self.* = .{ .wall_us = sample.wall_us, .monotonic_us = sample.monotonic_us };
-    }
-};

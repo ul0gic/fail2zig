@@ -33,9 +33,7 @@ const http = @import("net/http.zig");
 const ban_origin = @import("core/ban_origin.zig");
 const daemon = @import("native_daemon.zig");
 const max_jails = daemon.max_jails;
-const max_sources_per_jail = daemon.max_sources_per_jail;
 const Jail = daemon.Jail;
-const SourceStatus = daemon.SourceStatus;
 
 const LossJson = struct { sequence: u64, wall_us: i64, reason: []const u8, inode: u64, committed_offset: u64, observed_size: ?u64 };
 const SourceJson = struct {
@@ -167,8 +165,6 @@ pub fn Methods(comptime Coordinator: type) type {
         const monotonic = Coordinator.monotonic;
         const observationMs = Coordinator.observationMs;
         const observationSound = Coordinator.observationSound;
-        const quiet_interval_ms = Coordinator.quiet_interval_ms;
-        const sessionProcessor = Coordinator.sessionProcessor;
         const redacted_text = "<redacted>";
         pub fn lossJson(event: files.LossEvent) LossJson {
             return .{ .sequence = event.sequence, .wall_us = event.wall_us, .reason = @tagName(event.reason), .inode = event.inode, .committed_offset = event.committed_offset, .observed_size = event.observed_size };

@@ -4,7 +4,6 @@
 // Holds: A check runs only with no transaction open and on the current schema; a query that fails counts as skipped, never a mismatch.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
 const effects = @import("../core/native_effect.zig");
 const retry = @import("../core/native_retry.zig");

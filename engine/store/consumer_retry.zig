@@ -68,7 +68,6 @@ pub const Evictions = struct {
 
 pub fn Methods(comptime Store: type) type {
     return struct {
-        const SourceMaintenance = Store.SourceMaintenance;
         pub const EvictionReport = struct { evicted: ?detection.Subject, last_processed_us: i64 };
         pub const PoolOccupancy = struct { tracked: u32, banned: u32, tracking_limit: u32, ban_limit: u32 };
         const PoolPressure = enum { none, tracking, banned };

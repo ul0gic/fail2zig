@@ -110,10 +110,6 @@ pub const Backend = union(BackendTag) {
     pub fn flush(self: *Backend, jail: shared.JailId) BackendError!void {
         return self.vtable().flushFn(self.context(), jail);
     }
-
-    pub fn isAvailable(self: *Backend) bool {
-        return self.vtable().isAvailableFn(self.context());
-    }
 };
 
 pub const AvailabilityProbes = struct {

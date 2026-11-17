@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const LogFormat = @import("../config/native.zig").LogFormat;
 const logger = @import("logger.zig");
 
