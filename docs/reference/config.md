@@ -391,10 +391,13 @@ Using both `source` and `backend` in one section is an error. It never chooses
 the firewall backend.
 
 `native_ingestion` defaults to true; `false` fails validation with
-`NativeIngestionRequired`. `compatibility_manifest` (`[global]`) and
-`compatibility_pending` (`[global]` and jails) are migration-managed admission
-metadata; an enabled jail with either set fails with `CompatibilityNotAdmitted`. Do not clear blockers by hand to force an
-unsupported imported jail into service.
+`NativeIngestionRequired`. `compatibility_manifest` (`[global]`, a string) and
+`compatibility_pending` (`[global]` and jails, a boolean) are written by the
+migration tools. The manifest blocks nothing by itself. While
+`compatibility_pending` is true in a jail, that jail fails with
+`CompatibilityNotAdmitted` if enabled; while it is true in `[global]`, every
+enabled jail does. Do not clear it by hand to force an unsupported imported jail
+into service.
 
 <span id="validation"></span>
 

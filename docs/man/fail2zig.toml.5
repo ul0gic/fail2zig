@@ -306,11 +306,16 @@ fails validation with
 Default: true.
 .TP
 .B compatibility_manifest
-Admission metadata written by the migration tools, not by hand. An enabled jail in a configuration that
-carries it fails with
-.BR CompatibilityNotAdmitted ;
-resolve it through the migration workflow and do not clear it by hand to force
-an unsupported imported jail into service.
+String, written by the migration tools, not by hand. It blocks nothing by
+itself; see
+.BR compatibility_pending .
+.TP
+.B compatibility_pending
+Boolean, written by the migration tools, not by hand. While it is true, every
+enabled jail fails validation with
+.BR CompatibilityNotAdmitted .
+Resolve the import through the migration workflow; do not set it to false by
+hand to force an unsupported imported jail into service. Default: false.
 .
 .SH DEFAULTS SECTION
 All keys in this section apply to every jail unless overridden in the
@@ -765,12 +770,10 @@ Default:
 .IR reject .
 .TP
 .B compatibility_pending
-Admission metadata written by the migration tools, not by hand. A jail that carries it is not
-admitted while enabled
-.RB ( CompatibilityNotAdmitted );
-see
-.B compatibility_manifest
-in the global section.
+Boolean, written by the migration tools, not by hand. While it is true and the
+jail is enabled, validation fails with
+.BR CompatibilityNotAdmitted .
+The same key in the global section applies to every enabled jail. Default: false.
 .TP
 .B maxretry
 Optional integer (1–128). Overrides

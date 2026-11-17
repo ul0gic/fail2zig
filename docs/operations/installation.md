@@ -326,6 +326,168 @@ replacing an installation; never delete state to bypass a refusal. Released
 v0.3.0 binary state has no automatic converter, and releases before v0.4.7 are not
 an upgrade source: upgrade them through v0.4.7 first, or start from a fresh state.
 
+## Daemon log file and rotation
+
+By default the daemon logs to stderr, which the journal collects under the unit;
+nothing needs rotating. To log to a file, set an absolute path:
+
+```toml
+[global]
+log_target = "/var/log/fail2zig/fail2zig.log"
+```
+
+The shipped unit runs as `fail2zig` with `ProtectSystem=strict`, so the service
+cannot write under `/var/log` until the unit grants it. Add an override with
+`sudo systemctl edit fail2zig.service`:
+
+```ini
+[Service]
+LogsDirectory=fail2zig
+```
+
+systemd then creates `/var/log/fail2zig`, owned by the service user, and makes it
+writable for the service. Without the grant the daemon exits with
+`log target '/var/log/fail2zig/fail2zig.log' unusable: ...; refusing to start`.
+Changing `log_target` needs a restart, not a reload.
+
+The daemon reopens its log file when it receives `SIGUSR1`, so a rotation tool
+moves the old file away and then signals the daemon. A `logrotate` stanza, saved
+as `/etc/logrotate.d/fail2zig`:
+
+```
+/var/log/fail2zig/fail2zig.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill --signal=USR1 --kill-whom=main fail2zig.service
+    endscript
+}
+```
+
+- `delaycompress` keeps the just-rotated file uncompressed, so nothing is lost if
+  the daemon writes one more line before it reopens.
+- `--kill-whom=main` needs systemd 252 or newer; older versions spell it
+  `--kill-who=main`.
+- Do not use `copytruncate`; the reopen makes it unnecessary.
+- If the reopen fails, the daemon logs `log target reopen failed` and keeps
+  writing to the file it already had open.
+
+This stanza rotates the daemon's own log. The logs fail2zig watches are rotated by
+their own services; see the [log file lifecycle](../guides/log-lifecycle.md).
+
+## SELinux and AppArmor
+
+fail2zig is qualified live on Debian 13, which ships with AppArmor enabled and no
+profile for fail2zig, so the daemon runs unconfined by AppArmor and is confined
+by the systemd unit's own hardening. fail2zig ships no AppArmor profile and no
+SELinux policy module, and it has not been qualified on a host with SELinux in
+enforcing mode.
+
+On such a host, treat the following as the access a policy must allow. It is the
+same access the shipped unit grants:
+
+| Access | Why |
+| --- | --- |
+| Read the configured log files (`CAP_DAC_READ_SEARCH`) | File sources. |
+| Run `/usr/bin/journalctl` and read the journal | Journal sources. |
+| Netlink sockets with `CAP_NET_ADMIN` | The nftables backend. |
+| Run `iptables`, `ip6tables` and `ipset` | Only with the `iptables` or `ipset` backend. |
+| Read and write `/var/lib/fail2zig` | The state file. |
+| Create and serve a Unix socket in `/run/fail2zig` | The administrative commands. |
+| Read `/etc/fail2zig` and `/usr/share/zoneinfo` | Configuration and time zone data. |
+| Outbound DNS queries to `dns_server` | Only when a custom rule resolves host names. |
+| Listen on the metrics port | Only when `metrics_enabled = true`. |
+
+If the daemon starts under systemd on a permissive host and fails on an
+enforcing one, look for denials in the audit log (`ausearch -m avc -ts recent` on
+SELinux, `journalctl -k | grep -i apparmor` on AppArmor) before changing fail2zig's
+configuration. Reports from enforcing hosts are welcome as issues.
+
+## Uninstalling
+
+The installer has no uninstall option. Remove fail2zig in this order.
+
+1. **Decide what happens to the bans.** A normal stop leaves the installed
+   firewall rules in place so that protection survives a restart. To lift every
+   ban first, while the daemon is still running:
+
+   ```bash
+   sudo fail2zig firewall withdraw
+   ```
+
+2. **Stop and disable the service.**
+
+   ```bash
+   sudo systemctl disable --now fail2zig
+   ```
+
+3. **Remove what the daemon left in the kernel.** Everything fail2zig creates is
+   named `f2z_` followed by 24 hexadecimal characters. The rules are not saved
+   anywhere by fail2zig, so a reboot also removes them, unless your own firewall
+   tooling saved the running ruleset.
+
+   With the nftables backend it is one table:
+
+   ```bash
+   sudo nft list tables | grep f2z_
+   sudo nft delete table inet f2z_0123456789abcdef01234567
+   ```
+
+   With the iptables or ipset backend it is a chain of that name in both
+   `iptables` and `ip6tables`, a jump to it at the top of `INPUT`, and with ipset
+   two sets named `<name>_4` and `<name>_6`:
+
+   ```bash
+   sudo iptables -S INPUT | grep f2z_
+   sudo iptables -D INPUT <the rest of the printed rule, after "-A INPUT">
+   sudo iptables -F f2z_0123456789abcdef01234567
+   sudo iptables -X f2z_0123456789abcdef01234567
+   sudo ipset destroy f2z_0123456789abcdef01234567_4
+   ```
+
+   Use the name your host shows. The jump rule carries a comment, so delete it by
+   repeating the rule exactly as `iptables -S INPUT` prints it, with `-D` in place
+   of `-A`. Repeat the `iptables` commands with `ip6tables`, and destroy the `_6`
+   set as well.
+
+4. **Remove the installed files.**
+
+   ```bash
+   sudo rm /etc/systemd/system/fail2zig.service
+   sudo rm -r /etc/systemd/system/fail2zig.service.d
+   sudo systemctl daemon-reload
+   sudo rm /usr/local/bin/fail2zig
+   sudo rm /usr/local/share/man/man1/fail2zig.1 /usr/local/share/man/man5/fail2zig.toml.5
+   sudo rm -r /usr/local/share/doc/fail2zig
+   ```
+
+   The `fail2zig.service.d` directory exists only if you added an override.
+
+5. **Remove configuration and state, if you are not coming back.** The state
+   directory holds every ban, read position and the history; the configuration
+   directory holds your jails.
+
+   ```bash
+   sudo rm -r /etc/fail2zig /var/lib/fail2zig
+   ```
+
+6. **Remove the service account.**
+
+   ```bash
+   sudo userdel fail2zig
+   ```
+
+   `userdel` also removes the `fail2zig` group when no other user belongs to it;
+   otherwise run `sudo groupdel fail2zig`.
+
+If you installed with a different `FAIL2ZIG_PREFIX`, or configured a custom
+`state_file`, `socket_path` or `log_target`, remove those paths in place of the
+defaults above.
+
 ## Build from source
 
 Zig 0.14.1 is required. A ReleaseSafe build puts the combined executable in
