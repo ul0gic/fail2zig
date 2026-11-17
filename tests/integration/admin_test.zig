@@ -183,7 +183,7 @@ test "admin: unrecorded outcome is uncertain and the request remains fresh" {
     var probe = try engine.native_store_mod.Store.open(a, h.state_path);
     defer probe.close();
     try probe.inspectExec(
-        "CREATE TRIGGER bug025_admin_outcome BEFORE INSERT ON admin_requests " ++
+        "CREATE TRIGGER fail_admin_outcome BEFORE INSERT ON admin_requests " ++
             "BEGIN SELECT RAISE(FAIL,'injected outcome failure'); END;",
     );
     const uncertain = try sendAdminFrame(a, &h, request_id, body);
@@ -195,7 +195,7 @@ test "admin: unrecorded outcome is uncertain and the request remains fresh" {
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states;"));
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT mutation_revision FROM admin_revision WHERE id=1;"));
 
-    try probe.inspectExec("DROP TRIGGER bug025_admin_outcome;");
+    try probe.inspectExec("DROP TRIGGER fail_admin_outcome;");
     const applied = try sendAdminFrame(a, &h, request_id, body);
     defer applied.deinit(a);
     try t.expectEqual(@as(u16, 200), applied.code);
@@ -881,14 +881,14 @@ test "kernel: admin: a failure after one committed release page is partial and r
     var trigger_buffer: [512]u8 = undefined;
     const trigger = try std.fmt.bufPrintZ(
         &trigger_buffer,
-        "CREATE TRIGGER bug033_second_page BEFORE UPDATE OF lease_kind ON effect_owners " ++
+        "CREATE TRIGGER fail_second_page BEFORE UPDATE OF lease_kind ON effect_owners " ++
             "WHEN OLD.jail='sshd' AND OLD.lease_kind!=0 AND NEW.lease_kind=0 AND OLD.scope_key=x'{s}' " ++
             "BEGIN SELECT RAISE(FAIL,'injected final-key failure after 65 attempted releases'); END;",
         .{maximum_key},
     );
     try probe.inspectExec(trigger);
     var trigger_installed = true;
-    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug033_second_page;") catch {};
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER fail_second_page;") catch {};
     const partial = try sendAdminFrame(a, &h, request_id, body);
     defer partial.deinit(a);
     try t.expectEqual(@as(u16, 507), partial.code);
@@ -913,7 +913,7 @@ test "kernel: admin: a failure after one committed release page is partial and r
     try t.expectEqual(@as(u16, 507), restarted.code);
     try t.expect(std.mem.indexOf(u8, restarted.body, "\"mutation_revision\":67") != null);
     try expectRemainingDisableOwners(&probe, remaining_keys, remaining_first, remaining_second);
-    try probe.inspectExec("DROP TRIGGER bug033_second_page;");
+    try probe.inspectExec("DROP TRIGGER fail_second_page;");
     trigger_installed = false;
 
     var timer = try std.time.Timer.start();
@@ -1118,12 +1118,12 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
         .{scope_hex},
     );
     try probe.inspectExec(
-        "CREATE TRIGGER bug035_settlement_failure BEFORE UPDATE OF status ON effect_intents " ++
+        "CREATE TRIGGER fail_settlement BEFORE UPDATE OF status ON effect_intents " ++
             "WHEN OLD.status=1 AND NEW.status=2 AND NEW.lease_kind=0 " ++
             "BEGIN SELECT RAISE(FAIL,'injected post-removal settlement failure'); END;",
     );
     var trigger_installed = true;
-    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug035_settlement_failure;") catch {};
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER fail_settlement;") catch {};
     const request_id = [_]u8{35} ** 32;
     const uncertain = try sendAdminFrame(a, &h, request_id, body);
     defer uncertain.deinit(a);
@@ -1160,7 +1160,7 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(uncertain_query));
-    try probe.inspectExec("DROP TRIGGER bug035_settlement_failure;");
+    try probe.inspectExec("DROP TRIGGER fail_settlement;");
     trigger_installed = false;
     try h.startDaemon();
     try waitReady(&h, 15_000);
