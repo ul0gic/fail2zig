@@ -79,9 +79,9 @@ namespaces beside the installed service:
 An installed v0.4.9 service with sixteen jails and 5,000 bans was then upgraded
 to this release with the installer under the shipped unit. It took the schema 29
 step with its backup, started in 20 seconds with every ban in the kernel, applied
-and lifted a manual ban, answered `history` with no cursor on a state whose first
-9,689 records had been pruned, and restarted with all 5,000 bans still in the
-kernel and no service restart counted.
+and lifted a manual ban, answered `history` with no cursor on a state whose
+retained history begins at sequence 9,690, and restarted with all 5,000 bans
+still in the kernel and no service restart counted.
 
 The namespace suites ran on a build that preceded the last change to the plain
 `history` reader; the upgrade run used the final code. Not run: an upgrade from
